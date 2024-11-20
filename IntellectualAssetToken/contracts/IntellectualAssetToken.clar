@@ -19,6 +19,19 @@
     }
 )
 
+;; Input validation functions
+(define-private (is-valid-uint (value uint))
+    (> value u0)
+)
+
+;; Validate asset ID
+(define-private (is-valid-asset-id (asset-id uint))
+    (match (map-get? asset-details {asset-id: asset-id})
+        entry true
+        false
+    )
+)
+
 ;; Mint tokens based on asset valuation
 (define-public (mint-ip-tokens 
     (asset-id uint) 
@@ -26,10 +39,16 @@
     (token-amount uint)
 )
     (begin
+        ;; Validate inputs
+        (asserts! (is-valid-uint asset-id) (err u400))
+        (asserts! (is-valid-uint initial-valuation) (err u400))
+        (asserts! (is-valid-uint token-amount) (err u400))
+        (asserts! (not (is-valid-asset-id asset-id)) (err u409)) ;; Prevent duplicate asset IDs
+        
         ;; Only contract owner can mint initial tokens
         (asserts! (is-eq tx-sender (var-get contract-owner)) (err u403))
         
-        ;; Store asset details
+        ;; Store asset details with validated inputs
         (map-set asset-details 
             {asset-id: asset-id}
             {
@@ -40,8 +59,11 @@
             }
         )
         
-        ;; Mint tokens to the owner
-        (ft-mint? intellectual-asset-token token-amount tx-sender)
+        ;; Mint tokens to the owner with input validation
+        (match (ft-mint? intellectual-asset-token token-amount tx-sender)
+            success (ok success)
+            error (err u500)
+        )
     )
 )
 
@@ -54,6 +76,9 @@
         (
             (asset (unwrap! (map-get? asset-details {asset-id: asset-id}) (err u404)))
         )
+        ;; Validate input
+        (asserts! (is-valid-uint new-valuation) (err u400))
+        
         ;; Only asset owner or contract owner can update valuation
         (asserts! 
             (or 
@@ -63,7 +88,7 @@
             (err u403)
         )
         
-        ;; Update current valuation
+        ;; Update current valuation with validated input
         (map-set asset-details 
             {asset-id: asset-id}
             (merge asset {current-valuation: new-valuation})
@@ -83,6 +108,10 @@
             (asset (unwrap! (map-get? asset-details {asset-id: asset-id}) (err u404)))
             (royalty-amount (/ (* total-revenue (var-get royalty-rate)) u100))
         )
+        ;; Validate inputs
+        (asserts! (is-valid-uint asset-id) (err u400))
+        (asserts! (is-valid-uint total-revenue) (err u400))
+        
         ;; Distribute royalties proportionally to token holders
         ;; Note: Actual distribution mechanism would require more complex logic
         (ok royalty-amount)
@@ -94,7 +123,14 @@
     (amount uint)
     (recipient principal)
 )
-    (ft-transfer? intellectual-asset-token amount tx-sender recipient)
+    (begin
+        ;; Validate inputs
+        (asserts! (is-valid-uint amount) (err u400))
+        (asserts! (not (is-eq tx-sender recipient)) (err u403))
+        
+        ;; Transfer tokens
+        (ft-transfer? intellectual-asset-token amount tx-sender recipient)
+    )
 )
 
 ;; Read-only functions to get asset information
