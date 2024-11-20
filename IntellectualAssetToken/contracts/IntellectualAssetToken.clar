@@ -1,22 +1,29 @@
 ;; IntellectualAssetToken (IAT)
 ;; A smart contract for tokenizing intellectual property assets
 
-(define-fungible-token intellectual-asset-token)
+(define-fungible-token ip-tokens)
 
 ;; Storage for contract metadata and asset details
 (define-data-var contract-owner principal tx-sender)
-(define-data-var total-asset-value uint u0)
-(define-data-var royalty-rate uint u10) ;; Default 10% royalty rate
+(define-data-var total-asset-count uint u0)
 
-;; Storing asset details
+;; Storing asset details with enhanced ownership tracking
 (define-map asset-details 
     {asset-id: uint}
     {
         owner: principal,
         initial-valuation: uint,
         current-valuation: uint,
-        total-tokens: uint
+        total-tokens: uint,
+        token-holders: (list 10 principal),
+        transferable: bool
     }
+)
+
+;; Token holder tracking
+(define-map token-balances 
+    {asset-id: uint, holder: principal}
+    uint
 )
 
 ;; Input validation functions
@@ -24,16 +31,8 @@
     (> value u0)
 )
 
-;; Validate asset ID
-(define-private (is-valid-asset-id (asset-id uint))
-    (match (map-get? asset-details {asset-id: asset-id})
-        entry true
-        false
-    )
-)
-
-;; Mint tokens based on asset valuation
-(define-public (mint-ip-tokens 
+;; Mint tokens for IP ownership
+(define-public (register-ip-ownership 
     (asset-id uint) 
     (initial-valuation uint)
     (token-amount uint)
@@ -43,31 +42,93 @@
         (asserts! (is-valid-uint asset-id) (err u400))
         (asserts! (is-valid-uint initial-valuation) (err u400))
         (asserts! (is-valid-uint token-amount) (err u400))
-        (asserts! (not (is-valid-asset-id asset-id)) (err u409)) ;; Prevent duplicate asset IDs
         
-        ;; Only contract owner can mint initial tokens
-        (asserts! (is-eq tx-sender (var-get contract-owner)) (err u403))
+        ;; Increment total asset count
+        (var-set total-asset-count (+ (var-get total-asset-count) u1))
         
-        ;; Store asset details with validated inputs
+        ;; Store asset details
         (map-set asset-details 
             {asset-id: asset-id}
             {
                 owner: tx-sender,
                 initial-valuation: initial-valuation,
                 current-valuation: initial-valuation,
-                total-tokens: token-amount
+                total-tokens: token-amount,
+                token-holders: (list tx-sender),
+                transferable: true
             }
         )
         
-        ;; Mint tokens to the owner with input validation
-        (match (ft-mint? intellectual-asset-token token-amount tx-sender)
-            success (ok success)
+        ;; Mint tokens and track initial holder balance
+        (match (ft-mint? ip-tokens token-amount tx-sender)
+            success 
+            (begin
+                (map-set token-balances 
+                    {asset-id: asset-id, holder: tx-sender} 
+                    token-amount
+                )
+                (ok success)
+            )
             error (err u500)
         )
     )
 )
 
-;; Update asset valuation
+;; Transfer fractional IP tokens
+(define-public (transfer-ip-tokens 
+    (asset-id uint)
+    (amount uint)
+    (recipient principal)
+)
+    (let 
+        (
+            (asset (unwrap! (map-get? asset-details {asset-id: asset-id}) (err u404)))
+            (sender-balance (default-to u0 (map-get? token-balances {asset-id: asset-id, holder: tx-sender})))
+            (recipient-balance (default-to u0 (map-get? token-balances {asset-id: asset-id, holder: recipient})))
+            (recipient-tokens (map-get? token-balances {asset-id: asset-id, holder: recipient}))
+        )
+        ;; Validate transfer conditions
+        (asserts! (is-valid-uint amount) (err u400))
+        (asserts! (<= amount sender-balance) (err u403))
+        (asserts! (get transferable asset) (err u403))
+        
+        ;; Perform token transfer
+        (match (ft-transfer? ip-tokens amount tx-sender recipient)
+            success 
+            (begin
+                ;; Update sender and recipient balances
+                (map-set token-balances 
+                    {asset-id: asset-id, holder: tx-sender} 
+                    (- sender-balance amount)
+                )
+                (map-set token-balances 
+                    {asset-id: asset-id, holder: recipient} 
+                    (+ (default-to u0 recipient-tokens) amount)
+                )
+                
+                ;; Update token holders list if needed
+                (if (is-some recipient-tokens)
+                    true
+                    (map-set asset-details 
+                        {asset-id: asset-id}
+                        (merge asset {
+                            token-holders: (unwrap-panic 
+                                (as-max-len? 
+                                    (append (get token-holders asset) recipient) 
+                                    u10
+                                ))
+                        })
+                    )
+                )
+                
+                (ok success)
+            )
+            error (err u500)
+        )
+    )
+)
+
+;; Update IP asset valuation
 (define-public (update-asset-valuation 
     (asset-id uint)
     (new-valuation uint)
@@ -76,10 +137,8 @@
         (
             (asset (unwrap! (map-get? asset-details {asset-id: asset-id}) (err u404)))
         )
-        ;; Validate input
+        ;; Validate and restrict valuation updates
         (asserts! (is-valid-uint new-valuation) (err u400))
-        
-        ;; Only asset owner or contract owner can update valuation
         (asserts! 
             (or 
                 (is-eq tx-sender (get owner asset))
@@ -88,7 +147,7 @@
             (err u403)
         )
         
-        ;; Update current valuation with validated input
+        ;; Update asset valuation
         (map-set asset-details 
             {asset-id: asset-id}
             (merge asset {current-valuation: new-valuation})
@@ -98,44 +157,15 @@
     )
 )
 
-;; Distribute royalties based on token holdings
-(define-public (distribute-royalties 
+;; Get IP token balance
+(define-read-only (get-token-balance 
     (asset-id uint)
-    (total-revenue uint)
+    (holder principal)
 )
-    (let 
-        (
-            (asset (unwrap! (map-get? asset-details {asset-id: asset-id}) (err u404)))
-            (royalty-amount (/ (* total-revenue (var-get royalty-rate)) u100))
-        )
-        ;; Validate inputs
-        (asserts! (is-valid-uint asset-id) (err u400))
-        (asserts! (is-valid-uint total-revenue) (err u400))
-        
-        ;; Distribute royalties proportionally to token holders
-        ;; Note: Actual distribution mechanism would require more complex logic
-        (ok royalty-amount)
-    )
+    (default-to u0 (map-get? token-balances {asset-id: asset-id, holder: holder}))
 )
 
-;; Transfer IP tokens
-(define-public (transfer-ip-tokens 
-    (amount uint)
-    (recipient principal)
-)
-    (begin
-        ;; Validate inputs
-        (asserts! (is-valid-uint amount) (err u400))
-        (asserts! (not (is-eq tx-sender recipient)) (err u403))
-        
-        ;; Transfer tokens
-        (ft-transfer? intellectual-asset-token amount tx-sender recipient)
-    )
-)
-
-;; Read-only functions to get asset information
+;; Read asset details
 (define-read-only (get-asset-details (asset-id uint))
     (map-get? asset-details {asset-id: asset-id})
 )
-
-;; Additional helper functions can be added as needed
